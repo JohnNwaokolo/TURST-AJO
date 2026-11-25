@@ -1,0 +1,8 @@
+data/trustajo.db.json
+data/trustajo.db.json.tmp
+data/server.log
+data/server.pid
+node_modules/
+.env
+.env.*
+!.env.example

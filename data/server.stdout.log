@@ -1,0 +1,3 @@
+Using the in-memory local demo store. Set Supabase credentials to enable persistence.
+Trust Ajo is running at http://127.0.0.1:4173/
+Press Ctrl+C to stop the local server.

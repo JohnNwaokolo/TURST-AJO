@@ -1,0 +1,17 @@
+{
+  "name": "trust-ajo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Trust Ajo prototype with a Node.js API and Supabase PostgreSQL",
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "scripts": {
+    "dev": "node server.js",
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "2.119.0",
+    "dotenv": "^16.4.7"
+  }
+}
