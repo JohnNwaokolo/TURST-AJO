@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title">
+  <title id="title">Trust Ajo savings-circle mark</title>
+  <rect x="8" y="8" width="112" height="112" rx="27" fill="#206B52"/>
+  <circle cx="64" cy="64" r="31" fill="none" stroke="#F6F4EC" stroke-width="5"/>
+  <circle cx="64" cy="33" r="8" fill="#C8E66B"/>
+  <circle cx="91" cy="79.5" r="8" fill="#F6F4EC"/>
+  <circle cx="37" cy="79.5" r="8" fill="#F6F4EC"/>
+  <circle cx="64" cy="64" r="10" fill="#D9A640"/>
+</svg>

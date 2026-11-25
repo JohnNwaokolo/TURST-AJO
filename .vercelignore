@@ -1,0 +1,9 @@
+node_modules
+.git
+.vercel
+.env*
+data/**
+AJO/**
+README.md
+PRODUCT_BRIEF.md
+supabase/**

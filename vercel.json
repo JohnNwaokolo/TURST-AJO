@@ -1,0 +1,5 @@
+{
+  "rewrites": [
+    { "source": "/supabase.js", "destination": "/api/supabase-js" }
+  ]
+}

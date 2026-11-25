@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 620 140" role="img" aria-labelledby="title desc">
+  <title id="title">Trust Ajo</title>
+  <desc id="desc">Trust Ajo wordmark with a savings-circle symbol.</desc>
+  <g transform="translate(14 14)">
+    <rect width="112" height="112" rx="27" fill="#206B52"/>
+    <circle cx="56" cy="56" r="31" fill="none" stroke="#F6F4EC" stroke-width="5"/>
+    <circle cx="56" cy="25" r="8" fill="#C8E66B"/>
+    <circle cx="83" cy="71.5" r="8" fill="#F6F4EC"/>
+    <circle cx="29" cy="71.5" r="8" fill="#F6F4EC"/>
+    <circle cx="56" cy="56" r="10" fill="#D9A640"/>
+  </g>
+  <text x="154" y="91" font-family="Georgia, 'Times New Roman', serif" font-size="62" font-weight="700" letter-spacing="-2">
+    <tspan fill="#15352E">Trust </tspan><tspan fill="#206B52">Ajo</tspan>
+  </text>
+</svg>

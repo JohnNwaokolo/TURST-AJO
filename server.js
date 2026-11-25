@@ -8,12 +8,13 @@ const http = require('node:http');
 const path = require('node:path');
 
 const ROOT = __dirname;
-const DATA_DIR = path.join(ROOT, 'data');
+const DATA_DIR = process.env.VERCEL ? path.join('/tmp', 'trust-ajo') : path.join(ROOT, 'data');
 const PUBLIC_DIR = path.join(ROOT, 'public');
 const PORT = Number(process.env.PORT || 4173);
-const BASE_URL = `${(process.env.APP_BASE_URL || `http://localhost:${PORT}`).replace(/\/+$/, '')}/`;
+const BASE_URL = `${(process.env.APP_BASE_URL || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : `http://localhost:${PORT}`)).replace(/\/+$/, '')}/`;
 const STATE_ID = 'main';
 const MAX_BODY_BYTES = 1024 * 1024;
+const INVITE_CODE_TTL_MS = 10 * 60 * 1000;
 const SUPABASE_URL = process.env.SUPABASE_URL?.trim() || '';
 const SUPABASE_PUBLISHABLE_KEY = (process.env.SUPABASE_PUBLISHABLE_KEY || process.env.SUPABASE_ANON_KEY || '').trim();
 const SUPABASE_ORIGIN = (() => {
@@ -28,9 +29,9 @@ fs.mkdirSync(DATA_DIR, { recursive: true });
 
 let db;
 let supabaseClient;
+let initializationPromise;
 let supabaseAuthClient;
 let saveQueue = Promise.resolve();
-const paymentVerificationJobs = new Map();
 const rateLimitBuckets = new Map();
 
 function now() {
@@ -112,7 +113,7 @@ function upcomingDueDates(group) {
   if (!Number.isFinite(next.getTime())) return dates;
   const today = startOfToday();
   while (next < today) next = nextCycleDate(next, group.frequency);
-  const horizon = dayOffset(365, today);
+  const horizon = dayOffset(90, today);
   while (next <= horizon) {
     dates.add(next.toISOString().slice(0, 10));
     next = nextCycleDate(next, group.frequency);
@@ -139,8 +140,32 @@ function makeJoinCode() {
   return code;
 }
 
-function flutterwaveTestMode() {
-  return /^FLWSECK_TEST-/.test(process.env.FLW_SECRET_KEY || '');
+function inviteCodeExpiry(from = now()) {
+  return iso(new Date(new Date(from).getTime() + INVITE_CODE_TTL_MS));
+}
+
+function rotateInviteCode(group) {
+  if (group.joinCode) group.lastExpiredJoinCodeHash = hashText(group.joinCode);
+  group.joinCode = makeJoinCode();
+  group.joinCodeExpiresAt = inviteCodeExpiry();
+}
+
+async function rotateExpiredInviteCodes() {
+  const currentTime = Date.now();
+  let rotated = false;
+  for (const group of db.groups) {
+    if (!Number.isFinite(Date.parse(group.joinCodeExpiresAt)) || Date.parse(group.joinCodeExpiresAt) <= currentTime) {
+      rotateInviteCode(group);
+      addAudit(group.ownerId, 'group.invite.expired', `Automatically replaced the expired invite code for ${group.name}.`);
+      rotated = true;
+    }
+  }
+  if (rotated) await saveDb();
+}
+
+function isExpiredInviteCode(code) {
+  const codeHash = hashText(code);
+  return db.groups.some((group) => group.lastExpiredJoinCodeHash === codeHash);
 }
 
 function safeEqualText(first, second) {
@@ -211,24 +236,54 @@ function finishCycleIfPaid(group) {
     .filter((row) => row.groupId === group.id && row.cycleKey === cycle && ['paid_demo', 'demo_recorded', 'paid'].includes(row.status))
     .map((row) => row.userId));
   if (group.members.length < group.capacity || !group.members.every((member) => paidMembers.has(member.userId))) return false;
-  if (group.payoutOrder.length > 1) group.payoutOrder.push(group.payoutOrder.shift());
   group.nextDueAt = iso(nextScheduledDueDate(group.nextDueAt, group.frequency));
   group.currentCycleKey = cycleKey(group.nextDueAt, group.frequency);
   group.lastCompletedCycleKey = cycle;
+  const recipientName = group.payoutOrder[0];
+  const recipient = group.members.find((member) => member.name === recipientName);
+  const payoutAmount = group.contributionAmount * group.members.length;
+  if (recipient) {
+    const recipientUser = userById(recipient.userId);
+    if (recipientUser) {
+      recipientUser.walletBalance = Number(recipientUser.walletBalance || 0) + payoutAmount;
+      addTransaction(recipient.userId, `Ajo payout · ${group.name}`, 'Ajo payout', payoutAmount, 'in', 'demo_only', 'Sample wallet credit after all group contributions were recorded.');
+      db.walletTransactions.push({ id: newId(), userId: recipient.userId, title: `Ajo payout · ${group.name}`, amount: payoutAmount, direction: 'in', fee: 0, kind: 'payout', status: 'demo_only', createdAt: iso(now()) });
+    }
+  }
+  group.payoutTurnsInCurrentRotation = Number(group.payoutTurnsInCurrentRotation || 0) + 1;
+  if (group.payoutTurnsInCurrentRotation >= group.members.length) {
+    group.completedRotations = Number(group.completedRotations || 0) + 1;
+    group.payoutTurnsInCurrentRotation = 0;
+    group.memberEndChoices = {};
+    group.endDecisionStatus = 'awaiting_members';
+  }
+  if (group.payoutOrder.length > 1) group.payoutOrder.push(group.payoutOrder.shift());
   return true;
 }
 
 function seedDatabase() {
   const today = startOfToday();
   const salt = crypto.randomBytes(16).toString('base64');
+  const samplePassword = 'TrustAjoSample2026!';
+  const sampleHash = hashPassword(samplePassword, salt);
   const user = {
     id: 'u_demo', name: 'Adaeze Okafor', email: 'adaeze@trustajo.example', salt,
     passwordHash: hashPassword('TrustAjoDemo2026!', salt), passwordAlgorithm: 'sha256',
     businessName: 'Adaeze Market Studio', businessType: 'Fashion & retail', emailVerified: true,
     bvnStatus: 'not_started', ninStatus: 'not_started', monthlyIncomeGoal: 350000,
+    walletBalance: 48500, ratingEligibleSince: iso(new Date(Date.now() - 120 * 86400000)),
     preferences: { theme: 'system', contributionReminders: true, weeklyDigest: true, shareAlerts: true },
-    createdAt: iso(today),
+    createdAt: iso(dayOffset(-120)),
   };
+  const scenarioUsers = ['multiple', 'organizer', 'attention'].map((scenario) => ({
+    id: `u_demo_${scenario}`,
+    name: scenario === 'multiple' ? 'John Olawapamilerin Nwaokolo' : scenario === 'organizer' ? 'Mariam Yusuf' : 'Chidi Okafor',
+    email: `demo.${scenario}@trustajo.example`, salt, passwordHash: sampleHash, passwordAlgorithm: 'sha256',
+    businessName: '', businessType: '', emailVerified: true, bvnStatus: 'not_started', ninStatus: 'not_started',
+    walletBalance: scenario === 'attention' ? 800 : 42000,
+    preferences: { theme: 'light', contributionReminders: true, weeklyDigest: true, shareAlerts: true },
+    createdAt: iso(dayOffset(scenario === 'multiple' ? -120 : -12)), demoScenario: scenario,
+  }));
   const members1 = [
     { userId: 'u_demo', name: 'Adaeze Okafor', role: 'Member' },
     { userId: 'm_daniel', name: 'Daniel Eze', role: 'Member' },
@@ -244,21 +299,21 @@ function seedDatabase() {
   ];
   const weeklyGroup = {
     id: 'ajo-campus-makers', ownerId: 'u_demo', name: 'Campus Makers Circle',
-    joinCode: 'CAMPUS25',
-    purpose: 'A weekly circle for student-run businesses', frequency: 'Weekly',
+    joinCode: makeJoinCode(), joinCodeExpiresAt: inviteCodeExpiry(),
+    frequency: 'Weekly',
     contributionAmount: 25000, capacity: 5, currentCycleKey: cycleKey(today, 'Weekly'),
     nextDueAt: iso(dayOffset(2)),
     payoutOrder: ['Adaeze Okafor', 'Daniel Eze', 'Amaka Bello', 'Tunde Lawal', 'Zainab Yusuf'],
-    members: members1,
+    members: members1, completedRotations: 18, memberEndChoices: { m_daniel: 'leave', m_amaka: 'leave', m_tunde: 'leave', m_zainab: 'leave' }, endDecisionStatus: 'awaiting_members', status: 'active', chat: [{ id: 'seed-chat-1', userId: 'm_daniel', name: 'Daniel Eze', text: 'Please confirm the new due date before we start the next rotation.', createdAt: iso(dayOffset(-1)) }], swapRequests: [{ id: 'seed-swap-1', from: 'Daniel Eze', to: 'Adaeze Okafor', status: 'pending', createdAt: iso(dayOffset(-1)) }],
   };
   const monthlyGroup = {
-    id: 'ajo-market-women', ownerId: 'u_demo', name: 'Market Women Growth Circle',
-    joinCode: 'MARKET15',
-    purpose: 'Monthly stock-up savings with trusted sellers', frequency: 'Monthly',
+    id: 'ajo-market-women', ownerId: 'u_demo', name: 'Market Women Ajo Group',
+    joinCode: makeJoinCode(), joinCodeExpiresAt: inviteCodeExpiry(),
+    frequency: 'Monthly',
     contributionAmount: 15000, capacity: 4, currentCycleKey: cycleKey(today, 'Monthly'),
-    nextDueAt: iso(dayOffset(5)),
-    payoutOrder: ['Kemi Adebayo', 'Adaeze Okafor', 'Femi Ogun', 'Chisom Obi'],
-    members: members2,
+    nextDueAt: iso(dayOffset(0)),
+    payoutOrder: ['Adaeze Okafor', 'Kemi Adebayo', 'Femi Ogun', 'Chisom Obi'],
+    members: members2, completedRotations: 4, status: 'active', chat: [],
   };
   const contributions = [];
   for (let i = 1; i <= 4; i += 1) {
@@ -270,7 +325,7 @@ function seedDatabase() {
       createdAt: iso(new Date(past.getTime() + 9 * 60 * 60 * 1000)), note: 'Synthetic contribution history',
     });
   }
-  for (const member of [{ id: 'm_daniel', name: 'Daniel Eze' }, { id: 'm_amaka', name: 'Amaka Bello' }]) {
+  for (const member of [{ id: 'm_daniel', name: 'Daniel Eze' }, { id: 'm_amaka', name: 'Amaka Bello' }, { id: 'm_tunde', name: 'Tunde Lawal' }, { id: 'm_zainab', name: 'Zainab Yusuf' }]) {
     contributions.push({
       id: newId(), groupId: weeklyGroup.id, userId: member.id, memberName: member.name,
       amount: 25000, status: 'paid_demo', cycleKey: weeklyGroup.currentCycleKey,
@@ -287,11 +342,11 @@ function seedDatabase() {
       createdAt: iso(new Date(past.getTime() + 9 * 60 * 60 * 1000)), note: 'Synthetic contribution history',
     });
   }
-  contributions.push({
-    id: newId(), groupId: monthlyGroup.id, userId: 'm_kemi', memberName: 'Kemi Adebayo',
-    amount: 15000, status: 'paid_demo', cycleKey: monthlyGroup.currentCycleKey,
-    dueAt: monthlyGroup.nextDueAt, createdAt: iso(dayOffset(0)), note: 'Synthetic current-cycle entry',
-  });
+  for (const member of [{ id: 'm_kemi', name: 'Kemi Adebayo' }, { id: 'm_femi', name: 'Femi Ogun' }, { id: 'm_chisom', name: 'Chisom Obi' }]) {
+    contributions.push({ id: newId(), groupId: monthlyGroup.id, userId: member.id, memberName: member.name,
+      amount: 15000, status: 'paid_demo', cycleKey: monthlyGroup.currentCycleKey,
+      dueAt: monthlyGroup.nextDueAt, createdAt: iso(dayOffset(0)), note: 'Synthetic current-cycle entry' });
+  }
 
   const businessEntries = [];
   for (let monthOffset = 2; monthOffset < 60; monthOffset += 1) {
@@ -318,10 +373,38 @@ function seedDatabase() {
     );
   }
 
+  const makeScenarioGroup = (id, ownerId, name, frequency, amount, memberSpecs, dueAt, status = 'active') => ({
+    id, ownerId, name, joinCode: makeJoinCode(), joinCodeExpiresAt: inviteCodeExpiry(), frequency,
+    contributionAmount: amount, capacity: memberSpecs.length, currentCycleKey: cycleKey(dueAt, frequency),
+    nextDueAt: iso(dueAt), payoutOrder: memberSpecs.map((member) => member.name),
+    members: memberSpecs.map((member, index) => ({ userId: member.id, name: member.name, role: index === 0 ? 'Organizer' : 'Member' })),
+    completedRotations: 0, status, chat: [], swapRequests: [], memberEndChoices: {}, endDecisionStatus: 'active',
+  });
+  const multipleUser = { id: 'u_demo_multiple', name: 'John Olawapamilerin Nwaokolo' };
+  const attentionUser = { id: 'u_demo_attention', name: 'Chidi Okafor' };
+  const scenarioGroups = [
+    makeScenarioGroup('ajo-multiple-weekly', multipleUser.id, 'Weekend Market Ajo', 'Weekly', 5000, [multipleUser, { id: 'm_daniel', name: 'Daniel Eze' }, { id: 'm_amaka', name: 'Amaka Bello' }], dayOffset(4)),
+    makeScenarioGroup('ajo-multiple-monthly', multipleUser.id, 'Family Support Ajo', 'Monthly', 15000, [multipleUser, { id: 'm_femi', name: 'Femi Ogun' }, { id: 'm_kemi', name: 'Kemi Adebayo' }], dayOffset(12)),
+    makeScenarioGroup('ajo-multiple-stock', multipleUser.id, 'Small Business Stock Ajo', 'Weekly', 25000, [multipleUser, { id: 'm_tunde', name: 'Tunde Lawal' }, { id: 'm_zainab', name: 'Zainab Yusuf' }], dayOffset(20)),
+    makeScenarioGroup('ajo-attention-group', attentionUser.id, 'Chidi’s Starter Ajo', 'Weekly', 10000, [attentionUser, { id: 'm_daniel', name: 'Daniel Eze' }, { id: 'm_amaka', name: 'Amaka Bello' }], dayOffset(-1)),
+  ];
+  for (const group of scenarioGroups.filter((item) => item.id === 'ajo-attention-group')) {
+    for (const member of group.members.slice(1)) contributions.push({ id: newId(), groupId: group.id, userId: member.userId, memberName: member.name, amount: group.contributionAmount, status: 'paid_demo', cycleKey: group.currentCycleKey, dueAt: group.nextDueAt, createdAt: iso(dayOffset(-1)), note: 'Synthetic scenario contribution' });
+  }
+
   return {
-    schemaVersion: 2,
-    users: [user], sessions: [], groups: [weeklyGroup, monthlyGroup], contributions, payments: [],
+    schemaVersion: 3,
+    users: [user, ...scenarioUsers, ...members1.map((member) => ({ id: member.userId, name: member.name, email: member.name.toLowerCase().replace(/[^a-z0-9]+/g, '.') + '@trustajo.example', salt, passwordHash: sampleHash, passwordAlgorithm: 'sha256', emailVerified: true, bvnStatus: 'not_started', ninStatus: 'not_started', walletBalance: 0, createdAt: iso(dayOffset(-120)), preferences: { theme: 'light', contributionReminders: true, weeklyDigest: true, shareAlerts: true } })), ...members2.filter((member) => !members1.some((other) => other.userId === member.userId)).map((member) => ({ id: member.userId, name: member.name, email: member.name.toLowerCase().replace(/[^a-z0-9]+/g, '.') + '@trustajo.example', salt, passwordHash: sampleHash, passwordAlgorithm: 'sha256', emailVerified: true, bvnStatus: 'not_started', ninStatus: 'not_started', walletBalance: 0, createdAt: iso(dayOffset(-120)), preferences: { theme: 'light', contributionReminders: true, weeklyDigest: true, shareAlerts: true } }))], sessions: [], groups: [weeklyGroup, monthlyGroup, ...scenarioGroups], contributions, payments: [],
     orders: [], shares: [], audit: [], businessEntries,
+    publicOffers: [
+      { id: 'offer-demo-organizer', userId: 'u_demo_organizer', authorName: 'Mariam Yusuf', name: 'Starter stock Ajo', amount: 10000, frequency: 'Weekly', duration: 5, capacity: 4, nextDueAt: iso(dayOffset(7)), description: 'Looking for members building a steady savings habit.', interests: ['m_daniel', 'm_amaka'], comments: [], createdAt: iso(dayOffset(-1)) },
+      { id: 'offer-market-run', userId: 'm_kemi', name: 'Market stock-up Ajo', amount: 5000, frequency: 'Weekly', duration: 6, capacity: 5, nextDueAt: iso(dayOffset(7)), description: 'Looking for reliable members for six turns. Let us agree terms together.', interests: [], comments: [{ id: 'offer-comment-1', userId: 'm_femi', name: 'Femi Ogun', text: 'Can we keep the due date on Fridays?', createdAt: iso(dayOffset(-1)) }], createdAt: iso(dayOffset(-2)) },
+      { id: 'offer-makers', userId: 'm_amaka', name: 'Makers Ajo group', amount: 25000, frequency: 'Monthly', duration: 5, capacity: 5, nextDueAt: iso(dayOffset(14)), description: 'For makers planning business stock purchases.', interests: [], comments: [], createdAt: iso(dayOffset(-1)) },
+    ],
+    walletTransactions: [
+      { id: 'wallet-seed-1', userId: 'u_demo', title: 'Sample wallet opening balance', amount: 48500, direction: 'in', fee: 0, kind: 'seed', status: 'demo_only', createdAt: iso(dayOffset(-3)) },
+    ],
+    disputes: [], guarantorRequests: [],
     transactions: [
       { id: 'tx-in-1', userId: 'u_demo', title: 'Customer payment', category: 'Incoming', amount: 30000,
         direction: 'in', reference: 'TA-SAMPLE-730145', status: 'confirmed_demo', createdAt: iso(dayOffset(-1)), note: 'Synthetic connected-source credit' },
@@ -343,12 +426,29 @@ function seedDatabase() {
 
 function normalizeDatabase(value) {
   const result = value && typeof value === 'object' ? value : {};
-  for (const field of ['users', 'sessions', 'groups', 'contributions', 'payments', 'orders', 'shares', 'audit', 'transactions', 'products', 'businessEntries']) {
-    if (!Array.isArray(result[field])) result[field] = [];
+  const seeded = seedDatabase();
+  for (const field of ['users', 'sessions', 'groups', 'contributions', 'payments', 'orders', 'shares', 'audit', 'transactions', 'products', 'businessEntries', 'publicOffers', 'walletTransactions', 'disputes', 'guarantorRequests']) {
+    if (!Array.isArray(result[field])) result[field] = ['publicOffers', 'walletTransactions'].includes(field) ? seeded[field] : [];
+  }
+  for (const member of seeded.users) if (!result.users.some((user) => user.id === member.id)) result.users.push(member);
+  if (!result.groups.some((group) => group.id === 'ajo-campus-makers')) result.groups.unshift(seeded.groups[0]);
+  if (!result.groups.some((group) => group.id === 'ajo-market-women')) result.groups.push(seeded.groups[1]);
+  for (const group of seeded.groups.filter((item) => item.id.startsWith('ajo-multiple-') || item.id === 'ajo-attention-group')) {
+    if (!result.groups.some((existing) => existing.id === group.id)) result.groups.push(group);
+  }
+  for (const offer of seeded.publicOffers.filter((item) => item.id === 'offer-demo-organizer')) {
+    if (!result.publicOffers.some((existing) => existing.id === offer.id)) result.publicOffers.push(offer);
   }
   for (const group of result.groups) {
     if (!group.joinCode) group.joinCode = makeJoinCode();
+    if (!Number.isFinite(Date.parse(group.joinCodeExpiresAt))) group.joinCodeExpiresAt = iso(new Date(0));
+    if (!Array.isArray(group.chat)) group.chat = [];
+    if (!Number.isFinite(group.completedRotations)) group.completedRotations = 0;
+    if (!group.memberEndChoices) group.memberEndChoices = {};
+    if (!group.endDecisionStatus) group.endDecisionStatus = 'active';
+    if (!group.status) group.status = 'active';
   }
+  for (const member of result.users) if (!Number.isFinite(member.walletBalance)) member.walletBalance = 0;
   if (!result.passport) result.passport = seedDatabase().passport;
   return result;
 }
@@ -429,7 +529,25 @@ function userById(id) {
   return db.users.find((user) => user.id === id) || null;
 }
 
+function applyDemoScenario(user, scenario) {
+  user.demoScenario = scenario;
+  user.walletBalance = scenario === 'member' ? 25000 : scenario === 'attention' ? 800 : 42000;
+  if (scenario === 'organizer') db.groups = db.groups.filter((group) => group.sourceOfferId !== 'offer-demo-organizer');
+  if (scenario === 'organizer') {
+    const offer = db.publicOffers.find((item) => item.id === 'offer-demo-organizer');
+    if (offer) { offer.userId = user.id; offer.authorName = user.name; offer.interests = ['m_daniel', 'm_amaka']; offer.formedGroupId = null; }
+  }
+  if (scenario === 'attention') user.walletBalance = 800;
+}
+
 function newSession(userId) {
+  // The Vercel prototype uses an in-memory store, so a database-backed session
+  // disappears when a request lands on another serverless instance. The sample
+  // account is public by design; use a stateless sample-only cookie for it.
+  if (userId === 'u_demo' && !supabaseAuthClient) {
+    const secure = BASE_URL.startsWith('https://') ? '; Secure' : '';
+    return `trustajo_session=trust-ajo-public-demo-v1; HttpOnly; SameSite=Lax; Path=/; Max-Age=43200${secure}`;
+  }
   const raw = crypto.randomBytes(32).toString('hex');
   const currentTime = Date.now();
   db.sessions = db.sessions.filter((session) => Date.parse(session.expiresAt) > currentTime);
@@ -450,6 +568,7 @@ function cookieMap(req) {
 function authUser(req) {
   const token = cookieMap(req).trustajo_session;
   if (!token) return null;
+  if (token === 'trust-ajo-public-demo-v1' && !supabaseAuthClient) return userById('u_demo');
   const tokenHash = hashText(token);
   const session = db.sessions.find((item) => item.tokenHash === tokenHash && Date.parse(item.expiresAt) > Date.now());
   return session ? userById(session.userId) : null;
@@ -539,94 +658,6 @@ function addTransaction(userId, title, category, amount, direction, status, note
   });
 }
 
-async function flutterwaveRequest(pathname, options = {}) {
-  const response = await fetch(`https://api.flutterwave.com/v3/${pathname}`, {
-    method: options.method || 'GET',
-    headers: {
-      Authorization: `Bearer ${process.env.FLW_SECRET_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: options.body ? JSON.stringify(options.body) : undefined,
-    signal: AbortSignal.timeout(15000),
-  });
-  const payload = await response.json().catch(() => null);
-  if (!response.ok || payload?.status !== 'success') {
-    throw new Error('Flutterwave could not complete that request. Check the test key and try again.');
-  }
-  return payload.data;
-}
-
-async function verifyAndRecordPayment(txRef, transactionId) {
-  const existing = paymentVerificationJobs.get(txRef);
-  if (existing) return existing.transactionId === String(transactionId) ? existing.promise : 'review';
-  const job = { transactionId: String(transactionId), promise: null };
-  job.promise = verifyAndRecordPaymentOnce(txRef, transactionId);
-  paymentVerificationJobs.set(txRef, job);
-  try {
-    return await job.promise;
-  } finally {
-    if (paymentVerificationJobs.get(txRef) === job) paymentVerificationJobs.delete(txRef);
-  }
-}
-
-async function verifyAndRecordPaymentOnce(txRef, transactionId) {
-  const payment = db.payments.find((item) => item.txRef === txRef);
-  if (!payment) return 'unknown';
-  if (payment.status === 'successful') return 'success';
-  if (!/^\d+$/.test(String(transactionId || ''))) return 'failed';
-
-  let tx;
-  try {
-    tx = await flutterwaveRequest(`transactions/${encodeURIComponent(String(transactionId))}/verify`);
-  } catch {
-    return 'pending';
-  }
-
-  if (tx.status !== 'successful') {
-    if (['failed', 'cancelled'].includes(String(tx.status).toLowerCase())) {
-      payment.status = String(tx.status).toLowerCase();
-      await saveDb();
-      return payment.status;
-    }
-    return 'pending';
-  }
-
-  const amountMatches = Number(tx.amount) === Number(payment.amount)
-    && Number(tx.charged_amount ?? tx.amount) === Number(payment.amount);
-  const valid = tx.tx_ref === payment.txRef && tx.currency === payment.currency && amountMatches;
-  if (!valid) {
-    payment.status = 'review_required';
-    await saveDb();
-    return 'review';
-  }
-
-  const group = db.groups.find((item) => item.id === payment.groupId);
-  if (!group) return 'unknown';
-  if (isContributionRecorded(payment.groupId, payment.userId, payment.cycleKey)) {
-    payment.status = 'duplicate_review';
-    await saveDb();
-    return 'review';
-  }
-
-  const user = userById(payment.userId);
-  if (!user) return 'unknown';
-  payment.status = 'successful';
-  payment.transactionId = String(tx.id);
-  payment.providerReference = String(tx.flw_ref || '');
-  payment.paidAt = iso(now());
-  db.contributions.push({
-    id: newId(), groupId: group.id, userId: user.id, memberName: user.name,
-    amount: payment.amount, status: 'paid', cycleKey: payment.cycleKey,
-    dueAt: group.nextDueAt, createdAt: payment.paidAt, paymentReference: payment.txRef,
-    note: 'Flutterwave test transaction verified; no payout was sent.',
-  });
-  const cycleCompleted = finishCycleIfPaid(group);
-  payment.cycleCompleted = cycleCompleted;
-  addAudit(user.id, 'contribution.payment_verified', `Flutterwave confirmed a contribution to ${group.name}.`);
-  await saveDb();
-  return 'success';
-}
-
 function bootstrap(user) {
   const mine = db.contributions.filter((row) => row.userId === user.id && ['paid_demo', 'demo_recorded', 'paid'].includes(row.status));
   const businessEntries = db.businessEntries.filter((row) => row.userId === user.id)
@@ -636,15 +667,21 @@ function bootstrap(user) {
   const groups = [];
   for (const group of db.groups) {
     if (!group.members.some((member) => member.userId === user.id)) continue;
+    if (user.demoScenario === 'member' && group.id !== 'ajo-campus-makers') continue;
+    if (user.demoScenario === 'multiple' && !group.id.startsWith('ajo-multiple-')) continue;
+    if (user.demoScenario === 'attention' && group.id !== 'ajo-attention-group') continue;
     const current = db.contributions.filter((row) => row.groupId === group.id && row.cycleKey === group.currentCycleKey);
     const paid = current.filter((row) => ['paid_demo', 'demo_recorded', 'paid'].includes(row.status));
     const mineThisCycle = paid.some((row) => row.userId === user.id);
     groups.push({
-      id: group.id, name: group.name, purpose: group.purpose, frequency: group.frequency,
+      id: group.id, name: group.name, frequency: group.frequency,
       contributionAmount: group.contributionAmount, capacity: group.capacity,
       memberCount: group.members.length, paidThisCycle: paid.length, nextDueAt: group.nextDueAt,
       myContributionStatus: mineThisCycle ? 'recorded' : 'due', payoutOrder: group.payoutOrder, members: group.members,
+      chat: group.chat || [], swapRequests: group.swapRequests || [], completedRotations: group.completedRotations || 0,
+      memberEndChoices: group.memberEndChoices || {}, endDecisionStatus: group.endDecisionStatus || 'active', status: group.status || 'active',
       joinCode: group.ownerId === user.id ? group.joinCode : null,
+      joinCodeExpiresAt: group.ownerId === user.id ? group.joinCodeExpiresAt : null,
     });
   }
   const activity = db.transactions.filter((item) => item.userId === user.id).map((item) => ({ ...item }));
@@ -662,11 +699,28 @@ function bootstrap(user) {
   }));
   const audit = db.audit.filter((item) => item.userId === user.id)
     .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt)).slice(0, 12);
+  const completedEntries = mine.length;
+  const ageDays = Math.floor((Date.now() - Date.parse(user.createdAt || now())) / 86400000);
+  const ratingEligible = completedEntries >= 20;
+  const onTime = mine.filter((row) => !row.dueAt || Date.parse(row.createdAt) <= Date.parse(row.dueAt) + 86400000).length;
+  const ratingScore = ratingEligible ? Math.max(3.5, Math.min(5, 3.5 + 1.5 * (onTime / Math.max(1, completedEntries)))) : null;
   return {
-    user: publicUser(user), groups, activity: activity.slice(0, 12), products: db.products,
+    user: publicUser(user), groups, activity: activity.slice(0, 100), products: db.products,
+    wallet: { balance: Number(user.walletBalance || 0), transactions: db.walletTransactions.filter((row) => row.userId === user.id).sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt)).slice(0, 12), fees: 'Illustrative sample fees: ₦15 up to ₦10,000; ₦30 up to ₦50,000; ₦50 up to ₦100,000; ₦100 above.' },
+    publicOffers: db.publicOffers.map((offer) => ({ ...offer, comments: (offer.comments || []).slice(-12), interested: (offer.interests || []).includes(user.id), isOwner: offer.userId === user.id, author: userById(offer.userId)?.name || offer.authorName || 'Trust Ajo member', interestCount: (offer.interests || []).length })),
+    rating: { eligible: user.demoScenario === 'member' ? false : ratingEligible, score: user.demoScenario === 'member' ? null : ratingScore, completedActivity: user.demoScenario === 'member' ? 0 : completedEntries, daysOnApp: ageDays, onTimeCount: onTime, totalCount: completedEntries, note: user.demoScenario === 'member' ? 'New member scenario: participation ratings unlock after 20 recorded contributions.' : ratingEligible ? 'Sample participation signal from recorded Ajo activity.' : 'Available after 20 completed contribution records.' },
+    verification: { email: user.emailVerified ? 'verified_demo' : 'not_started', bvn: user.bvnStatus || 'not_started', nin: user.ninStatus || 'not_started', note: 'Mock status only. Do not enter real identity numbers or upload real documents.' },
+    disputes: db.disputes.filter((item) => item.reporterId === user.id || item.reportedUserId === user.id),
+    guarantorCandidates: db.users.filter((candidate) => candidate.id.startsWith('u_demo_') && candidate.id !== user.id).map((candidate) => ({ id: candidate.id, name: candidate.name })),
+    guarantorRequests: db.guarantorRequests.filter((item) => item.memberUserId === user.id || item.guarantorUserId === user.id).map((item) => ({
+      id: item.id, groupId: item.groupId, groupName: db.groups.find((group) => group.id === item.groupId)?.name || 'Ajo group',
+      memberName: userById(item.memberUserId)?.name || 'Sample member', guarantorName: userById(item.guarantorUserId)?.name || 'Sample guarantor',
+      maxLiability: item.maxLiability, durationLabel: item.durationLabel, status: item.status,
+      incoming: item.guarantorUserId === user.id,
+    })),
     businessEntries,
     shares, audit, demoMode: true, storageMode: supabaseClient ? 'supabase' : 'local-memory',
-    paymentMode: flutterwaveTestMode() ? 'flutterwave-test' : 'demo', generatedAt: iso(now()),
+    paymentMode: 'simulated-wallet', generatedAt: iso(now()),
     passport: {
       monthlyInflow: passport.monthlyInflow, incomeConsistency: passport.incomeConsistency,
       savingsBehaviour: passport.savingsBehaviour, businessAgeMonths: passport.businessAgeMonths,
@@ -701,6 +755,7 @@ async function handle(req, res) {
   res.setHeader('Referrer-Policy', 'no-referrer');
   const connectSources = SUPABASE_ORIGIN ? `'self' ${SUPABASE_ORIGIN}` : "'self'";
   res.setHeader('Content-Security-Policy', `default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src ${connectSources}; base-uri 'self'; form-action 'self'; frame-ancestors 'none'`);
+  await rotateExpiredInviteCodes();
 
   if (method === 'GET' && (route === '/' || route === '/share')) {
     return sendText(res, fs.readFileSync(path.join(PUBLIC_DIR, 'index.html'), 'utf8'), 'text/html; charset=utf-8');
@@ -709,6 +764,9 @@ async function handle(req, res) {
     return sendText(res, fs.readFileSync(path.join(PUBLIC_DIR, 'app.js'), 'utf8'), 'text/javascript; charset=utf-8');
   }
   if (method === 'GET' && route === '/supabase.js') {
+    return sendText(res, fs.readFileSync(path.join(ROOT, 'node_modules', '@supabase', 'supabase-js', 'dist', 'umd', 'supabase.js'), 'utf8'), 'text/javascript; charset=utf-8');
+  }
+  if (method === 'GET' && route === '/api/supabase-js') {
     return sendText(res, fs.readFileSync(path.join(ROOT, 'node_modules', '@supabase', 'supabase-js', 'dist', 'umd', 'supabase.js'), 'utf8'), 'text/javascript; charset=utf-8');
   }
   if (method === 'GET' && route === '/styles.css') {
@@ -720,7 +778,7 @@ async function handle(req, res) {
   if (method === 'GET' && route === '/api/health') {
     return sendJson(res, 200, {
       ok: true, app: 'Trust Ajo', mode: supabaseClient ? 'supabase' : 'local-demo',
-      payments: flutterwaveTestMode() ? 'flutterwave-test' : 'local-only',
+      payments: 'simulated-wallet',
     });
   }
   if (method === 'GET' && route === '/api/config') {
@@ -732,37 +790,10 @@ async function handle(req, res) {
       } : { enabled: false },
     });
   }
-  if (method === 'GET' && route === '/payments/flutterwave/callback') {
-    const txRef = String(url.searchParams.get('tx_ref') || '');
-    const transactionId = String(url.searchParams.get('transaction_id') || '');
-    const providerStatus = String(url.searchParams.get('status') || '').toLowerCase();
-    let result = 'failed';
-    if (providerStatus === 'successful' && txRef && transactionId) {
-      result = await verifyAndRecordPayment(txRef, transactionId);
-    } else if (txRef && ['cancelled', 'failed'].includes(providerStatus)) {
-      const payment = db.payments.find((item) => item.txRef === txRef);
-      if (payment?.status === 'pending') {
-        payment.status = providerStatus;
-        await saveDb();
-      }
-      result = providerStatus;
-    }
-    res.writeHead(303, { Location: `${BASE_URL}?payment=${encodeURIComponent(result)}`, 'Cache-Control': 'no-store' });
-    return res.end();
+  if ((method === 'GET' && route === '/payments/flutterwave/callback')
+    || (method === 'POST' && route === '/api/payments/flutterwave/webhook')) {
+    return sendJson(res, 410, { error: 'External payment processing is disabled in the simulated-wallet prototype.' });
   }
-  if (method === 'POST' && route === '/api/payments/flutterwave/webhook') {
-    const secretHash = process.env.FLW_SECRET_HASH || '';
-    const signature = String(req.headers['verif-hash'] || '');
-    if (!secretHash || !safeEqualText(signature, secretHash)) return sendJson(res, 401, { error: 'Invalid webhook signature.' });
-    const payload = await readJson(req);
-    const txRef = String(payload.data?.tx_ref || '');
-    const transactionId = String(payload.data?.id || '');
-    if (!txRef || !transactionId) return sendJson(res, 400, { error: 'Webhook is missing transaction details.' });
-    const result = await verifyAndRecordPayment(txRef, transactionId);
-    if (result === 'pending') return sendJson(res, 503, { error: 'Payment verification is temporarily unavailable.' });
-    return sendJson(res, 200, { ok: true, result });
-  }
-
   if (method === 'GET' && route === '/api/share') {
     const share = db.shares.find((item) => item.token === url.searchParams.get('token'));
     if (expiredOrRevoked(share)) return sendJson(res, 404, { error: 'This link expired or was revoked.' });
@@ -784,7 +815,10 @@ async function handle(req, res) {
 
   if (method === 'POST' && route === '/api/auth/demo') {
     if (supabaseAuthClient) return sendJson(res, 403, { error: 'Sample sign-in is disabled while Supabase Auth is configured.' });
-    const user = userById('u_demo');
+    const body = await readJson(req);
+    const scenario = ['member', 'multiple', 'organizer', 'attention'].includes(String(body.scenario)) ? String(body.scenario) : 'member';
+    const user = userById(scenario === 'member' ? 'u_demo' : `u_demo_${scenario}`) || userById('u_demo');
+    applyDemoScenario(user, scenario);
     const cookie = newSession(user.id);
     await saveDb();
     return sendJson(res, 200, { user: publicUser(user), demoMode: true }, { 'Set-Cookie': cookie });
@@ -916,6 +950,159 @@ async function handle(req, res) {
     await saveDb();
     return sendJson(res, 200, bootstrap(user));
   }
+  if (method === 'POST' && route === '/api/guarantors/demo/request') {
+    const body = await readJson(req);
+    const group = db.groups.find((item) => item.id === String(body.groupId || '') && item.members.some((member) => member.userId === user.id));
+    const guarantorUser = userById(String(body.guarantorUserId || ''));
+    const maxLiability = Number(body.maxLiability);
+    const maxExposure = group ? Number(group.contributionAmount) * Number(group.capacity) : 0;
+    if (!group) return sendJson(res, 404, { error: 'Choose an Ajo group you belong to.' });
+    if (!guarantorUser || !guarantorUser.id.startsWith('u_demo_') || guarantorUser.id === user.id) return sendJson(res, 400, { error: 'Choose another sample account to review this request.' });
+    if (body.termsAcknowledged !== 'on') return sendJson(res, 400, { error: 'Confirm that you understand this is a sample request.' });
+    if (!Number.isSafeInteger(maxLiability) || maxLiability < 500 || maxLiability > maxExposure) return sendJson(res, 400, { error: `Set a sample maximum between ₦500 and ${new Intl.NumberFormat('en-NG').format(maxExposure)}.` });
+    if (db.guarantorRequests.some((item) => item.memberUserId === user.id && item.guarantorUserId === guarantorUser.id && item.groupId === group.id && item.status === 'pending_demo')) return sendJson(res, 409, { error: 'There is already a pending sample request for this person and group.' });
+    db.guarantorRequests.push({ id: `guar-${newId().slice(0, 12)}`, groupId: group.id, memberUserId: user.id, guarantorUserId: guarantorUser.id, maxLiability, durationLabel: `Up to ${group.capacity} group turns`, status: 'pending_demo', createdAt: iso(now()), updatedAt: iso(now()) });
+    addAudit(user.id, 'guarantor.request.demo', `Sample guarantor request sent for ${group.name}; no legal obligation or money movement.`);
+    await saveDb();
+    return sendJson(res, 201, bootstrap(user));
+  }
+  if (method === 'POST' && route === '/api/guarantors/demo/respond') {
+    const body = await readJson(req);
+    const request = db.guarantorRequests.find((item) => item.id === String(body.requestId || '') && item.guarantorUserId === user.id);
+    const decision = String(body.decision || '');
+    if (!request) return sendJson(res, 404, { error: 'Sample guarantor request not found for this account.' });
+    if (request.status !== 'pending_demo') return sendJson(res, 409, { error: 'This sample request has already been answered.' });
+    if (!['accepted', 'declined'].includes(decision)) return sendJson(res, 400, { error: 'Choose accept or decline.' });
+    request.status = `${decision}_demo`;
+    request.updatedAt = iso(now());
+    addAudit(user.id, `guarantor.${decision}.demo`, `Sample request ${request.id} marked ${decision}; no legal obligation was created.`);
+    addAudit(request.memberUserId, `guarantor.${decision}.demo`, `The sample guarantor marked request ${request.id} ${decision}.`);
+    await saveDb();
+    return sendJson(res, 200, bootstrap(user));
+  }
+  if (method === 'POST' && route === '/api/wallet/move') {
+    const body = await readJson(req);
+    const kind = String(body.kind || '');
+    const amount = Number(body.amount);
+    if (!['deposit', 'withdraw'].includes(kind) || !Number.isSafeInteger(amount) || amount < 500 || amount > 1000000) return sendJson(res, 400, { error: 'Choose a sample deposit or withdrawal from ₦500 to ₦1,000,000.' });
+    const fee = amount <= 10000 ? 15 : amount <= 50000 ? 30 : amount <= 100000 ? 50 : 100;
+    const total = amount + (kind === 'deposit' ? fee : 0);
+    if (kind === 'withdraw' && Number(user.walletBalance || 0) < amount + fee) return sendJson(res, 409, { error: 'Wallet balance does not cover this withdrawal and sample fee.' });
+    user.walletBalance = Number(user.walletBalance || 0) + (kind === 'deposit' ? amount : -amount - fee);
+    const row = { id: newId(), userId: user.id, title: kind === 'deposit' ? 'Sample wallet deposit' : 'Sample wallet withdrawal', amount, direction: kind === 'deposit' ? 'in' : 'out', fee, kind, status: 'demo_only', createdAt: iso(now()) };
+    db.walletTransactions.push(row);
+    addAudit(user.id, `wallet.${kind}.demo`, `${kind} of ₦${amount} with illustrative ₦${fee} service fee; no funds moved.`);
+    await saveDb();
+    return sendJson(res, 200, bootstrap(user));
+  }
+  if (method === 'POST' && route === '/api/community/offers/create') {
+    const body = await readJson(req);
+    const amount = Number(body.amount), capacity = Number(body.capacity), duration = Number(body.duration);
+    const frequency = String(body.frequency || '');
+    const name = String(body.name || '').trim(), description = String(body.description || '').trim();
+    if (name.length < 4 || name.length > 70 || !Number.isSafeInteger(amount) || amount < 1000 || amount > 1000000 || !Number.isSafeInteger(capacity) || capacity < 3 || capacity > 20 || !Number.isSafeInteger(duration) || duration < 2 || duration > 52 || !['Weekly', 'Monthly'].includes(frequency) || description.length > 240) return sendJson(res, 400, { error: 'Enter an offer name, amount, weekly or monthly frequency, 2–52 turns, 3–20 seats and a short description.' });
+    db.publicOffers.unshift({ id: `offer-${newId().slice(0, 8)}`, userId: user.id, name, amount, frequency, duration, capacity, nextDueAt: String(body.nextDueAt || iso(dayOffset(7))), description, interests: [], comments: [], createdAt: iso(now()) });
+    addAudit(user.id, 'community.offer.created', `Posted public Ajo offer: ${name}.`);
+    await saveDb();
+    return sendJson(res, 201, bootstrap(user));
+  }
+  if (method === 'POST' && route === '/api/community/offers/comment') {
+    const body = await readJson(req), offer = db.publicOffers.find((item) => item.id === String(body.offerId));
+    const text = String(body.text || '').trim();
+    if (!offer) return sendJson(res, 404, { error: 'Community offer not found.' });
+    if (text.length < 1 || text.length > 240) return sendJson(res, 400, { error: 'Comments must be 1–240 characters.' });
+    offer.comments.push({ id: newId(), userId: user.id, name: user.name, text, createdAt: iso(now()) });
+    await saveDb();
+    return sendJson(res, 200, bootstrap(user));
+  }
+  if (method === 'POST' && route === '/api/community/offers/interest') {
+    const body = await readJson(req), offer = db.publicOffers.find((item) => item.id === String(body.offerId));
+    if (!offer) return sendJson(res, 404, { error: 'Community offer not found.' });
+    if (offer.userId === user.id) return sendJson(res, 409, { error: 'You posted this offer.' });
+    if (!Array.isArray(offer.interests)) offer.interests = [];
+    if (offer.interests.includes(user.id)) offer.interests = offer.interests.filter((id) => id !== user.id);
+    else if (offer.interests.length < offer.capacity - 1) offer.interests.push(user.id);
+    else return sendJson(res, 409, { error: 'This offer has no more available interest spots.' });
+    await saveDb();
+    return sendJson(res, 200, bootstrap(user));
+  }
+  if (method === 'POST' && route === '/api/community/offers/form-group') {
+    const body = await readJson(req), offer = db.publicOffers.find((item) => item.id === String(body.offerId));
+    if (!offer || offer.userId !== user.id) return sendJson(res, 404, { error: 'Only the offer author can form the private Ajo group.' });
+    if (offer.formedGroupId) return sendJson(res, 409, { error: 'This offer has already formed a private Ajo group.' });
+    const interestedUsers = (offer.interests || []).map(userById).filter(Boolean).slice(0, offer.capacity - 1);
+    const frequency = offer.frequency, firstDueAt = parseDueDate(String(offer.nextDueAt).slice(0, 10)) || dayOffset(frequency === 'Weekly' ? 7 : 30);
+    const members = [{ userId: user.id, name: user.name, role: 'Organizer' }, ...interestedUsers.map((member) => ({ userId: member.id, name: member.name, role: 'Member' }))];
+    const group = { id: `ajo-${newId().slice(0, 8)}`, ownerId: user.id, sourceOfferId: offer.id, name: offer.name, joinCode: makeJoinCode(), joinCodeExpiresAt: inviteCodeExpiry(), frequency, contributionAmount: offer.amount, capacity: offer.capacity, currentCycleKey: cycleKey(firstDueAt, frequency), nextDueAt: iso(firstDueAt), payoutOrder: members.map((member) => member.name), members, completedRotations: 0, status: 'active', chat: [], memberEndChoices: {}, endDecisionStatus: 'active' };
+    db.groups.push(group);
+    offer.formedGroupId = group.id;
+    addAudit(user.id, 'community.offer.group_formed', `Formed a private Ajo group from ${offer.name}.`);
+    await saveDb();
+    return sendJson(res, 201, bootstrap(user));
+  }
+  if (method === 'POST' && route === '/api/groups/chat') {
+    const body = await readJson(req), group = db.groups.find((item) => item.id === String(body.groupId));
+    const text = String(body.text || '').trim();
+    if (!group || !group.members.some((member) => member.userId === user.id)) return sendJson(res, 404, { error: 'Private Ajo group not found.' });
+    if (!text || text.length > 500) return sendJson(res, 400, { error: 'Messages must be 1–500 characters.' });
+    group.chat.push({ id: newId(), userId: user.id, name: user.name, text, createdAt: iso(now()) });
+    group.chat = group.chat.slice(-100);
+    await saveDb();
+    return sendJson(res, 200, bootstrap(user));
+  }
+  if (method === 'POST' && route === '/api/groups/swap') {
+    const body = await readJson(req), group = db.groups.find((item) => item.id === String(body.groupId));
+    const from = String(body.from || ''), to = String(body.to || '');
+    if (!group || !group.members.some((member) => member.userId === user.id) || !group.payoutOrder.includes(from) || !group.payoutOrder.includes(to) || from === to || (body.accept ? to !== user.name || from === user.name : from !== user.name)) return sendJson(res, 400, { error: 'Choose your payout turn and another member in your Ajo group.' });
+    if (!Array.isArray(group.swapRequests)) group.swapRequests = [];
+    const pending = group.swapRequests.find((item) => item.status === 'pending' && item.from === from && item.to === to);
+    if (body.accept) {
+      if (!pending || !group.members.some((member) => member.userId === user.id && member.name === to)) return sendJson(res, 404, { error: 'No matching swap request to accept.' });
+      const a = group.payoutOrder.indexOf(from), b = group.payoutOrder.indexOf(to);
+      [group.payoutOrder[a], group.payoutOrder[b]] = [group.payoutOrder[b], group.payoutOrder[a]];
+      pending.status = 'accepted'; pending.respondedAt = iso(now());
+    } else {
+      if (!group.members.some((member) => member.name === to)) return sendJson(res, 404, { error: 'The selected member is not in this group.' });
+      group.swapRequests.push({ id: newId(), from, to, status: 'pending', createdAt: iso(now()) });
+    }
+    await saveDb();
+    return sendJson(res, 200, bootstrap(user));
+  }
+  if (method === 'POST' && route === '/api/groups/end-choice') {
+    const body = await readJson(req), group = db.groups.find((item) => item.id === String(body.groupId));
+    const choice = String(body.choice || '');
+    if (!group || !group.members.some((member) => member.userId === user.id) || !['continue', 'replace', 'leave'].includes(choice)) return sendJson(res, 400, { error: 'Choose continue, find replacements, or leave for your Ajo group.' });
+    if (group.status === 'ended' || group.status === 'recruiting') return sendJson(res, 409, { error: 'This Ajo group is not collecting rotation choices right now.' });
+    if (group.memberEndChoices?.[user.id]) return sendJson(res, 409, { error: 'Your rotation choice is already recorded.' });
+    group.memberEndChoices[user.id] = choice;
+    if (group.members.every((member) => group.memberEndChoices[member.userId])) {
+      const choices = new Set(Object.values(group.memberEndChoices));
+      const leaving = group.members.filter((member) => group.memberEndChoices[member.userId] === 'leave');
+      if (leaving.length === group.members.length) {
+        group.endDecisionStatus = 'ended'; group.status = 'ended';
+      } else if (leaving.length) {
+        const leavingIds = new Set(leaving.map((member) => member.userId));
+        group.members = group.members.filter((member) => !leavingIds.has(member.userId));
+        group.payoutOrder = group.payoutOrder.filter((name) => group.members.some((member) => member.name === name));
+        group.endDecisionStatus = 'recruiting'; group.status = 'recruiting';
+      } else if (choices.size === 1 && choices.has('continue')) {
+        group.endDecisionStatus = 'active'; group.status = 'active'; group.memberEndChoices = {};
+      } else group.endDecisionStatus = 'needs_discussion';
+    } else group.endDecisionStatus = 'awaiting_members';
+    await saveDb();
+    return sendJson(res, 200, bootstrap(user));
+  }
+  if (method === 'POST' && route === '/api/disputes/demo') {
+    const body = await readJson(req), group = db.groups.find((item) => item.id === String(body.groupId));
+    if (!group || !group.members.some((member) => member.userId === user.id)) return sendJson(res, 404, { error: 'Ajo group not found.' });
+    const reportedUser = group.members.find((member) => member.userId === String(body.reportedUserId));
+    if (!reportedUser || reportedUser.userId === user.id) return sendJson(res, 400, { error: 'Choose another member from this group.' });
+    const dispute = { id: newId(), reporterId: user.id, reportedUserId: reportedUser.userId, groupId: group.id, reason: 'Sample missed-payment report', status: 'demo_review', evidenceNote: String(body.evidenceNote || '').slice(0, 240), createdAt: iso(now()) };
+    db.disputes.push(dispute);
+    addAudit(user.id, 'dispute.demo_created', 'Sample non-payment report; no identity provider was contacted.');
+    await saveDb();
+    return sendJson(res, 201, bootstrap(user));
+  }
   if (method === 'POST' && route === '/api/groups/create') {
     const body = await readJson(req);
     const name = String(body.name || '').trim();
@@ -934,7 +1121,7 @@ async function handle(req, res) {
     if (conflict) return sendJson(res, 409, { error: `That due date overlaps ${conflict.groupName} on ${conflict.date}. Choose another first due date.` });
     const group = {
       id: `ajo-${newId().slice(0, 8)}`, ownerId: user.id, name,
-      joinCode: makeJoinCode(), purpose: String(body.purpose || '').trim(), frequency, contributionAmount: amount, capacity,
+      joinCode: makeJoinCode(), joinCodeExpiresAt: inviteCodeExpiry(), frequency, contributionAmount: amount, capacity, status: 'active',
       currentCycleKey: cycleKey(firstDueAt, frequency), nextDueAt: iso(firstDueAt),
       payoutOrder: [user.name], members: [{ userId: user.id, name: user.name, role: 'Organizer' }],
     };
@@ -947,7 +1134,7 @@ async function handle(req, res) {
     const body = await readJson(req);
     const group = db.groups.find((item) => item.id === String(body.groupId));
     if (!group || group.ownerId !== user.id) return sendJson(res, 404, { error: 'Only the circle organizer can change this invite code.' });
-    group.joinCode = makeJoinCode();
+    rotateInviteCode(group);
     addAudit(user.id, 'group.invite.rotated', `Changed the invite code for ${group.name}.`);
     await saveDb();
     return sendJson(res, 200, bootstrap(user));
@@ -956,13 +1143,13 @@ async function handle(req, res) {
     if (!allowRequest(req, 'invite-lookup', 20, 15 * 60 * 1000)) return sendJson(res, 429, { error: 'Too many invite checks. Wait a few minutes, then try again.' });
     const joinCode = String(url.searchParams.get('code') || '').trim().toUpperCase();
     const group = db.groups.find((item) => item.joinCode === joinCode);
-    if (!group) return sendJson(res, 404, { error: 'That invite code was not found. Check it with the circle organizer.' });
+    if (!group) return sendJson(res, isExpiredInviteCode(joinCode) ? 410 : 404, { error: isExpiredInviteCode(joinCode) ? 'That invite code expired. Ask the organizer for the current code.' : 'That invite code was not found. Check it with the circle organizer.' });
     if (group.members.some((member) => member.userId === user.id)) return sendJson(res, 409, { error: 'You already belong to this circle.' });
     if (group.members.length >= group.capacity) return sendJson(res, 409, { error: 'This circle is full.' });
     const conflict = scheduleClash(user.id, group);
     return sendJson(res, 200, {
       group: {
-        id: group.id, name: group.name, purpose: group.purpose, frequency: group.frequency,
+        id: group.id, name: group.name, frequency: group.frequency,
         contributionAmount: group.contributionAmount, capacity: group.capacity,
         memberCount: group.members.length, nextDueAt: group.nextDueAt, payoutOrder: group.payoutOrder,
       },
@@ -973,67 +1160,35 @@ async function handle(req, res) {
     const body = await readJson(req);
     const joinCode = String(body.joinCode || '').trim().toUpperCase();
     const group = db.groups.find((item) => item.joinCode === joinCode);
-    if (!group) return sendJson(res, 404, { error: 'That invite code was not found. Check it with the circle organizer.' });
+    if (!group) return sendJson(res, isExpiredInviteCode(joinCode) ? 410 : 404, { error: isExpiredInviteCode(joinCode) ? 'That invite code expired. Ask the organizer for the current code.' : 'That invite code was not found. Check it with the circle organizer.' });
+    if (group.status === 'ended') return sendJson(res, 410, { error: 'This Ajo group has ended.' });
     if (group.members.some((member) => member.userId === user.id)) return sendJson(res, 409, { error: 'You already belong to this circle.' });
     if (group.members.length >= group.capacity) return sendJson(res, 409, { error: 'This circle is full.' });
     const conflict = scheduleClash(user.id, group);
     if (conflict) return sendJson(res, 409, { error: `Schedule clash: ${group.name} and ${conflict.groupName} are both due on ${conflict.date}. Ask an organizer to agree a different date before joining.` });
     group.members.push({ userId: user.id, name: user.name, role: 'Member' });
     group.payoutOrder.push(user.name);
+    if (group.status === 'recruiting' && group.members.length === group.capacity) {
+      group.status = 'active'; group.endDecisionStatus = 'active'; group.memberEndChoices = {};
+    }
     addAudit(user.id, 'group.joined', `Joined ${group.name} using an invite code.`);
     await saveDb();
     return sendJson(res, 200, bootstrap(user));
   }
   if (method === 'POST' && route === '/api/groups/pay') {
-    const body = await readJson(req);
-    const group = db.groups.find((item) => item.id === String(body.groupId));
-    if (!group || !group.members.some((member) => member.userId === user.id)) return sendJson(res, 404, { error: 'Circle not found for this member.' });
-    if (group.members.length < group.capacity) return sendJson(res, 409, { error: `This circle needs ${group.capacity - group.members.length} more member(s) before contributions start.` });
-    if (!contributionWindowOpen(group)) return sendJson(res, 409, { error: `Contributions open on ${String(group.nextDueAt).slice(0, 10)}. The circle cannot move to its next cycle early.` });
-    if (!flutterwaveTestMode()) return sendJson(res, 503, { error: 'Flutterwave sandbox checkout is not configured. Add a FLWSECK_TEST key, or use the local test contribution record.' });
-    if (isContributionRecorded(group.id, user.id, group.currentCycleKey)) return sendJson(res, 409, { error: 'Your contribution for this circle cycle is already recorded.' });
-    const nowMs = Date.now();
-    const existingPayment = db.payments.find((item) => item.groupId === group.id && item.userId === user.id
-      && item.cycleKey === group.currentCycleKey && ['pending', 'successful'].includes(item.status)
-      && (item.status === 'successful' || Date.parse(item.createdAt) > nowMs - 30 * 60 * 1000));
-    if (existingPayment?.status === 'successful') return sendJson(res, 409, { error: 'Payment for this circle cycle is already confirmed.' });
-    if (existingPayment?.status === 'pending') return sendJson(res, 409, { error: 'A checkout is already open for this cycle. Finish it or wait 30 minutes before trying again.' });
-
-    const payment = {
-      id: newId(), txRef: `TA-${crypto.randomBytes(18).toString('hex')}`,
-      userId: user.id, groupId: group.id, cycleKey: group.currentCycleKey,
-      amount: group.contributionAmount, currency: 'NGN', status: 'pending', createdAt: iso(now()),
-    };
-    db.payments.push(payment);
-    await saveDb();
-    try {
-      const checkout = await flutterwaveRequest('payments', {
-        method: 'POST',
-        body: {
-          tx_ref: payment.txRef,
-          amount: payment.amount,
-          currency: payment.currency,
-          redirect_url: `${BASE_URL}payments/flutterwave/callback`,
-          customer: { email: user.email, name: user.name },
-          meta: { groupId: group.id, cycleKey: group.currentCycleKey },
-          customizations: { title: 'Trust Ajo Contribution', description: `${group.name} contribution` },
-        },
-      });
-      if (!checkout?.link) throw new Error('Flutterwave did not return a checkout link.');
-      return sendJson(res, 201, { checkoutUrl: checkout.link, txRef: payment.txRef });
-    } catch {
-      payment.status = 'failed';
-      await saveDb();
-      return sendJson(res, 502, { error: 'Flutterwave could not start checkout. Confirm your test key and try again.' });
-    }
+    return sendJson(res, 410, { error: 'Hosted payment checkout is disabled in this prototype. Use the simulated wallet contribution flow.' });
   }
   if (method === 'POST' && route === '/api/groups/contribute') {
     const body = await readJson(req);
     const group = db.groups.find((item) => item.id === String(body.groupId));
     if (!group || !group.members.some((member) => member.userId === user.id)) return sendJson(res, 404, { error: 'Group not found for this member.' });
+    if (group.status === 'ended') return sendJson(res, 409, { error: 'This Ajo group has ended.' });
     if (group.members.length < group.capacity) return sendJson(res, 409, { error: `This circle needs ${group.capacity - group.members.length} more member(s) before contributions start.` });
     if (!contributionWindowOpen(group)) return sendJson(res, 409, { error: `Contributions open on ${String(group.nextDueAt).slice(0, 10)}. The circle cannot move to its next cycle early.` });
     if (isContributionRecorded(group.id, user.id, group.currentCycleKey)) return sendJson(res, 409, { error: 'A contribution is already recorded for this cycle.' });
+    if (Number(user.walletBalance || 0) < group.contributionAmount) return sendJson(res, 409, { error: 'Wallet balance is too low. Add sample funds before recording this Ajo contribution.' });
+    user.walletBalance -= group.contributionAmount;
+    db.walletTransactions.push({ id: newId(), userId: user.id, title: `Ajo contribution · ${group.name}`, amount: group.contributionAmount, direction: 'out', fee: 0, kind: 'contribution', status: 'demo_only', createdAt: iso(now()) });
     db.contributions.push({
       id: newId(), groupId: group.id, userId: user.id, memberName: user.name,
       amount: group.contributionAmount, status: 'demo_recorded', cycleKey: group.currentCycleKey,
@@ -1118,8 +1273,27 @@ server.on('error', (error) => {
   process.exitCode = 1;
 });
 
+async function initializeOnce() {
+  if (!initializationPromise) initializationPromise = initializeDatabase();
+  return initializationPromise;
+}
+
+async function vercelHandler(req, res) {
+  try {
+    await initializeOnce();
+    server.emit('request', req, res);
+  } catch (error) {
+    if (res.headersSent) return res.destroy();
+    return sendJson(res, 500, { error: 'Trust Ajo could not initialize.' });
+  }
+}
+
 async function main() {
-  await initializeDatabase();
+  await initializeOnce();
+  const inviteRotationTimer = setInterval(() => {
+    rotateExpiredInviteCodes().catch((error) => console.error('Invite code rotation failed:', error.message));
+  }, 10000);
+  inviteRotationTimer.unref();
   server.listen(PORT, '127.0.0.1', () => {
     console.log(`Trust Ajo is running at ${BASE_URL}`);
     console.log('Press Ctrl+C to stop the local server.');
@@ -1132,9 +1306,15 @@ async function shutdown() {
   });
 }
 
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
-main().catch(async (error) => {
-  console.error('Trust Ajo could not start:', error.message);
-  process.exit(1);
-});
+if (require.main === module) {
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+  main().catch(async (error) => {
+    console.error('Trust Ajo could not start:', error.message);
+    process.exit(1);
+  });
+}
+
+module.exports = vercelHandler;
+module.exports.handle = handle;
+module.exports.initializeOnce = initializeOnce;

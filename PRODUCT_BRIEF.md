@@ -1,71 +1,64 @@
-# Trust Ajo: product brief
+# Trust Ajo product brief
 
-## The problem we are testing
+## Product hypothesis
 
-People use rotating savings circles to save with people they know. The group depends on clear agreements: who is in, how much each person contributes, when contributions are due, and whose turn comes next. When that information is spread across messages, memory, or separate notebooks, members can struggle to check the same record or catch a schedule conflict before joining.
+Trust Ajo combines a simulated wallet, a public Ajo offer board, and private Ajo groups. Members can find groups that fit their contribution range, discuss terms in public before joining, then coordinate contributions and payout order in a private group space. This is a prototype hypothesis, not evidence of reduced defaults, increased trust, or business impact.
 
-Trust Ajo is testing whether a simple, member-visible record can reduce that uncertainty while keeping the group in charge of its own rules. This is a product hypothesis, not a measured impact claim. The next step is to test it with savings-circle members and organizers in Nigeria, including people who use low-cost phones or unreliable connections.
+## Prototype experience
 
-## Who it is for
+- A sample wallet shows a balance, simulated deposits and withdrawals, illustrative fee bands, Ajo contribution debits, payout credits, and an activity ledger. No funds move.
+- Members can post public Ajo offers and search/filter them by contribution range, frequency, minimum seats, minimum turns, and text. They can comment and express interest. The author can form a private group with interested registered members; each private group has its own member-only chat.
+- Ajo groups have a contribution, cadence, due date, capacity, payout order, invite code, private chat, payout-swap requests, and a member-by-member choice after each full rotation.
+- A swap changes the schedule only after the receiving member accepts. A completed rotation prompts members to continue, recruit replacements, or leave. The prototype records those choices.
+- The mock KYC screen shows sample email/BVN/NIN statuses and a sample missed-payment report. It never collects identity numbers or documents and cannot track or recover a person.
+- The sample guarantor workflow records a request, named sample account, maximum amount, and explicit accept/decline response. It sends no real invitation, verifies no identity, moves no money, and creates no legal obligation.
+- A member participation rating stays hidden until at least 20 completed contribution records. It uses sample on-time contribution history and is not a credit score or guarantee.
+- Activity records can be filtered by search text, category, direction, record status, date range, and amount range.
 
-- Members of informal rotating savings groups (Ajo, Esusu, Adashe, and similar circles).
-- Organizers who coordinate contribution dates, invite members, and keep the rotation understandable.
-- Small traders and makers who want a clearer record of their group participation.
+## Proposed real-wallet architecture (not implemented)
 
-## What the prototype does
+Each app user would map to a distinct customer or account reference with a suitably authorised payment partner. Trust Ajo's server would initiate funding and withdrawal requests, verify signed partner events, use idempotency keys to prevent duplicate ledger postings, keep an append-only transaction record, and reconcile the app ledger against partner reports. A pending request is not a confirmed payment. Before launch, legal and compliance review must confirm who may hold funds and which partner arrangement fits the exact flow. The prototype wallet remains fictional.
 
-- Creates weekly or monthly circles with a contribution amount, first due date, capacity, and visible payout order.
-- Lets invitees review those terms before joining. It checks capacity and same-day due-date conflicts, then checks again when the member confirms.
-- Lets an organizer rotate an invite code if it has been shared too widely.
-- Prevents duplicate entries for the same member and cycle, rejects contributions before the agreed due date, and advances the rotation after all members have contributed.
-- Records demo contributions locally, or starts a Flutterwave sandbox checkout when a test key is configured. A provider transaction is checked server-side before it is added to the ledger.
-- Shows a Financial Passport record count and clearly labeled synthetic figures for the sample account. Passport links allow selected profile sections, expire after 24 hours, and can be revoked.
-- Keeps sample payment-reference checks, sample marketplace products, and demo orders visibly within the prototype boundary.
+## Guarantor design questions before production
 
-## What the prototype does not claim
+The guarantor must be a separate person who independently reviews the specific member, Ajo group, maximum liability, trigger, duration, claim and dispute process, and any release conditions. Acceptance must be explicit and recorded against the version of the terms shown. Decide whether capacity assessment is necessary and proportionate, how a guarantor can challenge a claim, and whether the requirement would exclude or pressure members. Obtain Nigerian legal and privacy review before collecting identity or financial data or presenting the promise as enforceable.
 
-- It is not a wallet, bank, escrow service, credit bureau, lender, or payment recipient.
-- It does not send money to the person whose turn it is. The payout order is a record; payouts remain manual and outside the app.
-- A demo contribution is a member-entered ledger item, not independent proof that money moved. Flutterwave test mode uses test transactions only.
-- It does not connect bank accounts, calculate creditworthiness, make lending decisions, or verify email, BVN, or NIN with an identity provider.
-- Reminder, digest, and Passport-access settings are saved preferences only; this prototype does not send notifications.
-- The Supabase option is a development adapter using one shared JSONB application-state row and a server-side secret key. It is not ready for real member data or concurrent production traffic.
+## Pitch economics: editable scenario model
 
-## Likely judge questions
+These scenarios are arithmetic examples, not a market forecast, validated pricing, or a claim about customer demand. They assume the flat fee bands shown in the prototype, a 0.30% comparison fee on each wallet deposit or withdrawal, and that all shown transaction values are processed without provider cost. Real processing fees, failed transactions, taxes, support, fraud, compliance, and other costs are not included, so net results below are only contribution after the illustrative operating-cost assumption.
 
-### What exact problem does it solve?
+| Scenario | Active users | Fee events / user / month | Average fee-event amount | Monthly turnover | Monthly flat-band fee revenue* | Monthly 0.30% fee revenue | Monthly operating-cost assumption |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Early | 1,000 | 2 | ₦20,000 | ₦40,000,000 | ₦60,000 | ₦120,000 | ₦1,200,000 |
+| Base | 10,000 | 3 | ₦20,000 | ₦600,000,000 | ₦900,000 | ₦1,800,000 | ₦2,000,000 |
+| Growth | 40,000 | 4 | ₦20,000 | ₦3,200,000,000 | ₦4,800,000 | ₦9,600,000 | ₦4,000,000 |
 
-It helps a savings circle agree on the commitment before a person joins, spot recurring due-date clashes, and review the same contribution and payout-order record. The measurable outcome to test is fewer missed or disputed contributions and fewer avoidable schedule conflicts, compared with the group's current process.
+*At a ₦20,000 event the prototype flat fee is ₦30. Turnover is the sum of deposits and withdrawals; it is not revenue. Under the percentage comparison, the fee is 0.30% of each event’s amount.
 
-### Why is this more than a group chat?
+For an illustrative ₦20,000,000 initial investment, and assuming each scenario’s monthly revenue and cost persist for twelve months, annual operating contribution (fee revenue minus assumed operating costs) is:
 
-A chat is useful for discussion, but the prototype makes the current amount, recurring due date, membership capacity, contribution count, and payout order visible together. Joining requires reviewing those terms, and the server checks the schedule again at confirmation.
+| Scenario | Flat-band annual contribution | Flat-band ROI | 0.30% annual contribution | 0.30% ROI |
+|---|---:|---:|---:|---:|
+| Early | −₦13,680,000 | −68.4% | −₦12,960,000 | −64.8% |
+| Base | −₦13,200,000 | −66.0% | −₦2,400,000 | −12.0% |
+| Growth | ₦9,600,000 | 48.0% | ₦67,200,000 | 336.0% |
 
-### Does the app hold or transfer money?
+Formula: monthly turnover = active users × monthly fee events × average event amount. Fee revenue = events multiplied by the applicable fee. Annual operating contribution = 12 × (monthly fee revenue − monthly operating cost). Scenario ROI = annual operating contribution ÷ ₦20,000,000. This simplified ROI excludes investment recovery, financing, taxes, partner fees, and changes in user growth or transaction behavior; it must not be presented as investor return without a fuller financial model.
 
-No. Local demo entries do not move money. Optional Flutterwave checkout is restricted to test credentials. The app verifies a provider transaction before recording a test contribution, but it does not automate payouts.
+A defensible market sizing model still needs sourced estimates for reachable Ajo participants, serviceable locations, adoption, transaction frequency, typical amount, partner pricing, and operating costs. Calculate a serviceable annual transaction volume from evidenced reachable participants × expected fee events × average amount, then show revenue separately from volume. Validate every input before pitching it as a projection.
 
-### What does the Financial Passport prove?
+## What this prototype does not do
 
-At this stage, nothing beyond what the app itself has recorded. It is not a credit score or independently verified financial history. The sample account contains synthetic figures; new accounts have no bank or income connection. The sharing flow is permission-limited, time-limited, and revocable, but a recipient link is a bearer link that anyone holding it can open.
+- It is not a bank, live wallet, escrow service, lender, credit bureau, or payment recipient. Sample balances and ledger entries are fictional.
+- It does not connect debit cards or bank accounts, send live deposits or withdrawals, automatically collect real contributions, or pay out real money.
+- It does not verify identity with an external provider, independently verify payment performance, calculate creditworthiness, create enforceable guarantor commitments, or guarantee repayment.
+- The rating is a small sample participation indicator. It must not be represented as a credit or default-risk score.
+- The local demo store is in-memory. The optional development Supabase adapter stores the application state in one JSONB row and is not ready for real customer data or concurrent production traffic.
 
-### How are members protected from a circle clash?
+## Pilot measures
 
-Before joining, a person sees the amount, due date, frequency, capacity, and payout order. The app compares scheduled dates over the next year against circles that person already belongs to. It repeats the check when they confirm, so a stale preview cannot bypass a new conflict.
+With consent and sample-safe operations, evaluate offer-to-group conversion, time to fill a group, missed contributions, swaps, group continuation choices, disputes, member-reported trust, and the time organizers spend reconciling records. Include people using low-cost phones, limited data, or shared devices. Do not claim an impact before measuring it.
 
-### How will the team know the idea works?
+## Before production
 
-Run small, opt-in pilots with existing groups. Compare missed contributions, schedule clashes, time spent reconciling records, and member-reported trust before and after. Include members who use shared phones, have limited data, or prefer a language other than English. Do not claim impact until the pilot measures it.
-
-### What must happen before handling real data or money?
-
-Conduct member research and threat modeling; define consent, correction, dispute, and group-exit flows; move to normalized tenant-scoped tables with per-user authorization; use a reviewed authentication and recovery system; complete payment-provider sandbox and webhook reconciliation; define a lawful, operational payout model with an authorized partner; and obtain security, privacy, accessibility, and compliance review. Keep credit decisions outside the product unless the data, governance, consent, validation, and appeal process are separately designed and tested.
-
-## Build priorities
-
-1. Validate the problem and language with real circle members and organizers before expanding features.
-2. Add member consent and correction flows: confirm group rules, report an incorrect entry, leave a circle safely, and raise a dispute.
-3. Replace prototype storage and authentication with normalized Supabase tables, Supabase Auth, and tested row-level access policies.
-4. Add durable payment idempotency and reconciliation, then evaluate an authorized payout partner and a clear failure/complaint process.
-5. Make reminders real only after adding consent, delivery controls, and a reliable notification service.
-6. Test small-screen layouts, keyboard and screen-reader navigation, low-bandwidth behavior, and security boundaries with users.
+Conduct member research, threat modeling, privacy and accessibility review. Design tenant-scoped tables, access policies, audit trails, consent and appeal processes, reconciliation, customer support, and service availability. Select an appropriately authorized payment and payout partner and confirm the applicable compliance obligations before handling real money or identity data. Keep lending and credit decisions out of scope unless their data governance, validation, explanations, and appeals are separately designed and reviewed.
